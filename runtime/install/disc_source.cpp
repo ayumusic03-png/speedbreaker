@@ -168,13 +168,82 @@ namespace install
 
         struct ImageFile
         {
-            int fd = -1;
-            uint64_t size = 0;
+            static constexpr uint64_t kSvodBlockSize = 0x800;
+            static constexpr uint64_t kSvodHashBlockSize = 0x1000;
+            static constexpr uint64_t kSvodBlocksPerHash = 0x198;
+            static constexpr uint64_t kSvodBlocksPerFragment = 0x14388;
+            static constexpr uint64_t kSvodFragmentSize = 0xA290000;
+
+            int fd = -1; // ISO image, or the GOD header (kept open for its lifetime)
+            uint64_t size = 0; // logical image size
+            bool svod = false;
+            uint32_t startDataBlock = 0;
+            std::vector<int> fragments;
+            std::vector<uint64_t> fragmentSizes;
 
             ~ImageFile()
             {
                 if (fd >= 0)
                     close(fd);
+                for (int fragment : fragments)
+                    if (fragment >= 0)
+                        close(fragment);
+            }
+
+            static uint64_t SvodPhysicalOffset(uint64_t fileBlock)
+            {
+                const uint64_t level0Tables = fileBlock / kSvodBlocksPerHash + 1;
+                const uint64_t level1Tables = level0Tables / 0xA1C4 + 1;
+                return fileBlock * kSvodBlockSize
+                    + (level0Tables + level1Tables) * kSvodHashBlockSize;
+            }
+
+            bool ReadAt(uint64_t offset, void* buffer, size_t count, std::string& error) const
+            {
+                if (!svod)
+                    return ReadExact(fd, 0, size, offset, buffer, count, error);
+                if (offset > size || count > size - offset)
+                {
+                    error = "read past the end of the SVOD data";
+                    return false;
+                }
+
+                auto* out = static_cast<uint8_t*>(buffer);
+                while (count)
+                {
+                    const uint64_t logicalBlock = offset / kSvodBlockSize;
+                    const uint64_t inBlock = offset % kSvodBlockSize;
+                    const uint64_t startBlock = uint64_t(startDataBlock) * 2;
+                    if (logicalBlock < startBlock)
+                    {
+                        error = "SVOD block precedes its declared data start";
+                        return false;
+                    }
+                    const uint64_t trueBlock = logicalBlock - startBlock;
+                    const uint64_t fragmentIndex = trueBlock / kSvodBlocksPerFragment;
+                    const uint64_t fragmentBlock = trueBlock % kSvodBlocksPerFragment;
+                    if (fragmentIndex >= fragments.size())
+                    {
+                        error = "SVOD block refers to a missing data fragment";
+                        return false;
+                    }
+
+                    const uint64_t physical = SvodPhysicalOffset(fragmentBlock) + inBlock;
+                    const size_t chunk = size_t(std::min<uint64_t>(count, kSvodBlockSize - inBlock));
+                    if (physical > fragmentSizes[size_t(fragmentIndex)]
+                        || chunk > fragmentSizes[size_t(fragmentIndex)] - physical)
+                    {
+                        error = "SVOD data fragment is truncated";
+                        return false;
+                    }
+                    if (!ReadExact(fragments[size_t(fragmentIndex)], 0,
+                        fragmentSizes[size_t(fragmentIndex)], physical, out, chunk, error))
+                        return false;
+                    offset += chunk;
+                    out += chunk;
+                    count -= chunk;
+                }
+                return true;
             }
         };
 
@@ -188,7 +257,17 @@ namespace install
 
             bool Read(uint64_t at, void* buffer, size_t count, std::string& error) override
             {
-                return ReadExact(image->fd, offset, size, at, buffer, count, error);
+                if (at > size || count > size - at)
+                {
+                    error = "read past the end of the disc file";
+                    return false;
+                }
+                if (offset > UINT64_MAX - at)
+                {
+                    error = "disc file offset overflow";
+                    return false;
+                }
+                return image->ReadAt(offset + at, buffer, count, error);
             }
 
         private:
@@ -291,7 +370,7 @@ namespace install
 
                     table.resize(dir.size);
                     std::string error;
-                    if (!ReadExact(image.fd, 0, image.size, dir.offset, table.data(), table.size(), error))
+                    if (!image.ReadAt(dir.offset, table.data(), table.size(), error))
                         return Fail(Error::ReadError, "cannot read its directory: " + error);
 
                     visited.assign(dir.size / 4 + 1, false);
@@ -361,7 +440,7 @@ namespace install
             char magic[kMagicSize];
             std::string error;
             return offset + kMagicSize <= image.size
-                && ReadExact(image.fd, 0, image.size, offset, magic, kMagicSize, error)
+                && image.ReadAt(offset, magic, kMagicSize, error)
                 && memcmp(magic, kMagic, kMagicSize) == 0;
         }
 
@@ -372,14 +451,14 @@ namespace install
             std::string name = DisplayName(path);
             uint8_t head[8] = {};
             std::string error;
-            ReadExact(image.fd, 0, image.size, 0, head, std::min<uint64_t>(sizeof(head), image.size), error);
+            image.ReadAt(0, head, size_t(std::min<uint64_t>(sizeof(head), image.size)), error);
             uint8_t iso9660[5] = {};
-            bool dvd = image.size >= 0x8006 && ReadExact(image.fd, 0, image.size, 0x8001, iso9660, 5, error)
+            bool dvd = image.size >= 0x8006 && image.ReadAt(0x8001, iso9660, 5, error)
                 && memcmp(iso9660, "CD001", 5) == 0;
 
-            if (!memcmp(head, "CON ", 4) || !memcmp(head, "LIVE", 4) || !memcmp(head, "PIRS", 4))
-                return Fail(Error::UnsupportedFormat, name + " is an Xbox 360 content package (Games on Demand or Xbox Live), "
-                    "not a disc image. Use an image of the game disc (.iso) or its extracted files.");
+            if (!memcmp(head, "CON ", 4) || !memcmp(head, "PIRS", 4))
+                return Fail(Error::UnsupportedFormat, name + " is an Xbox 360 STFS package, not an XDVDFS disc image. "
+                    "This build supports multi-file LIVE/SVOD Games on Demand packages in XSF layout.");
             if (!memcmp(head, "XEX2", 4))
                 return Fail(Error::NotADiscImage, name + " is an Xbox 360 executable. Choose the folder that holds the "
                     "extracted disc (default.xex, Movies and NFS), or a disc image.");
@@ -478,6 +557,172 @@ namespace install
                 return result;
             }
             return firstFailure.Ok() ? Unrecognized(*image, path) : firstFailure;
+        }
+
+        // Multi-file Xbox 360 Games-on-Demand packages (SVOD, XSF layout).
+        // Data fragments contain 0x800-byte logical blocks interleaved with
+        // 0x1000-byte hash tables. This maps logical blocks without concatenating
+        // the physical DataNNNN files or loading them into memory.
+        uint32_t Le24(const uint8_t* p)
+        {
+            return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16;
+        }
+
+        uint64_t Le64(const uint8_t* p)
+        {
+            return uint64_t(Le32(p)) | uint64_t(Le32(p + 4)) << 32;
+        }
+
+        Result OpenSvod(const fs::path& headerPath, std::unique_ptr<DiscSource>& source)
+        {
+            auto image = std::make_shared<ImageFile>();
+            image->fd = platform::OpenFile(headerPath, kReadOnce);
+            if (image->fd < 0)
+                return Fail(Error::NotFound, std::format("Cannot open {}: {}.", headerPath.string(), strerror(errno)), headerPath.string());
+            platform::FileInfo headerInfo;
+            if (platform::InfoOf(image->fd, headerInfo) != 0)
+                return Fail(Error::ReadError, std::format("Cannot read {}: {}.", headerPath.string(), strerror(errno)), headerPath.string());
+            if (headerInfo.size < 0x3B0)
+                return Fail(Error::UnsupportedFormat, DisplayName(headerPath) + " has an incomplete Xbox 360 package header.");
+
+            uint8_t header[0x3B0]{};
+            std::string error;
+            if (!ReadExact(image->fd, 0, headerInfo.size, 0, header, sizeof(header), error))
+                return Fail(Error::ReadError, "Cannot read the Xbox 360 package header: " + error, headerPath.string());
+            if (memcmp(header, "LIVE", 4) != 0 || header[0x3A9] != 1)
+                return Fail(Error::UnsupportedFormat, DisplayName(headerPath) + " is not a multi-file Xbox 360 SVOD package.");
+            if (header[0x391] & 0x01)
+                return Fail(Error::UnsupportedFormat, "This SVOD uses Enhanced GDF, not the XSF layout supported by this reader.");
+
+            const uint32_t fragmentCount = Le32(header + 0x39D);
+            const uint64_t declaredPhysicalSize = Le64(header + 0x3A1);
+            image->startDataBlock = Le24(header + 0x395);
+            if (fragmentCount < 2 || fragmentCount > 4096)
+                return Fail(Error::CorruptImage, std::format("The SVOD header declares an invalid data-fragment count ({}).", fragmentCount), headerPath.string());
+
+            fs::path dataDir = headerPath;
+            dataDir += ".data";
+            if (!fs::is_directory(dataDir))
+                return Fail(Error::MissingFile, std::format("{} is missing its .data folder.", DisplayName(headerPath)), dataDir.string());
+
+            uint64_t physicalTotal = 0;
+            uint64_t logicalTotal = 0;
+            image->svod = true;
+            image->fragments.reserve(fragmentCount);
+            image->fragmentSizes.reserve(fragmentCount);
+            for (uint32_t i = 0; i < fragmentCount; ++i)
+            {
+                fs::path fragmentPath = dataDir / std::format("Data{:04}", i);
+                int fd = platform::OpenFile(fragmentPath, kReadOnce);
+                if (fd < 0)
+                    return Fail(Error::MissingFile, std::format("The SVOD data fragment {} is missing or cannot be opened: {}.", fragmentPath.filename().string(), strerror(errno)), fragmentPath.string());
+                platform::FileInfo fragmentInfo;
+                if (platform::InfoOf(fd, fragmentInfo) != 0)
+                {
+                    int saved = errno;
+                    close(fd);
+                    return Fail(Error::ReadError, std::format("Cannot inspect {}: {}.", fragmentPath.string(), strerror(saved)), fragmentPath.string());
+                }
+                if (!fragmentInfo.size || fragmentInfo.size > ImageFile::kSvodFragmentSize)
+                {
+                    close(fd);
+                    return Fail(Error::CorruptImage, std::format("{} has an invalid SVOD fragment size ({} bytes).", fragmentPath.filename().string(), fragmentInfo.size), fragmentPath.string());
+                }
+                image->fragments.push_back(fd);
+                image->fragmentSizes.push_back(fragmentInfo.size);
+                physicalTotal += fragmentInfo.size;
+
+                // Find the number of complete logical blocks represented by
+                // this fragment. The last DataNNNN file may be shorter.
+                uint64_t low = 0, high = ImageFile::kSvodBlocksPerFragment;
+                while (low < high)
+                {
+                    uint64_t mid = low + (high - low + 1) / 2;
+                    uint64_t end = ImageFile::SvodPhysicalOffset(mid - 1) + ImageFile::kSvodBlockSize;
+                    if (mid == 0 || end <= fragmentInfo.size)
+                        low = mid;
+                    else
+                        high = mid - 1;
+                }
+                logicalTotal += low * ImageFile::kSvodBlockSize;
+            }
+            if (declaredPhysicalSize && physicalTotal != declaredPhysicalSize)
+                return Fail(Error::CorruptImage, std::format("The SVOD header declares {} bytes of data, but its fragments contain {} bytes.", declaredPhysicalSize, physicalTotal), headerPath.string());
+            if (logicalTotal <= 32 * kSectorSize)
+                return Fail(Error::CorruptImage, "The SVOD data fragments are too small to contain an XDVDFS volume descriptor.", headerPath.string());
+            image->size = logicalTotal;
+
+            // XSF places its marker at physical 0x2000 and the XDVDFS volume
+            // descriptor at physical 0x12000. In logical SVOD addressing these
+            // are block 0 and block 32 respectively.
+            char xsf[3]{};
+            if (!image->ReadAt(0, xsf, sizeof(xsf), error) || memcmp(xsf, "XSF", 3) != 0)
+                return Fail(Error::UnsupportedFormat, "The SVOD data does not have the expected XSF header.", headerPath.string());
+            char magic[kMagicSize]{};
+            if (!image->ReadAt(32 * kSectorSize, magic, sizeof(magic), error) || memcmp(magic, kMagic, sizeof(magic)) != 0)
+                return Fail(Error::CorruptImage, "The XSF data has no XDVDFS volume descriptor at logical sector 32.", headerPath.string());
+
+            uint8_t descriptor[28]{};
+            if (!image->ReadAt(32 * kSectorSize, descriptor, sizeof(descriptor), error))
+                return Fail(Error::ReadError, "Cannot read the XDVDFS volume descriptor: " + error, headerPath.string());
+            TreeWalk walk{ *image, 0, {}, 0, {} };
+            Result r = walk.Walk(Le32(descriptor + 20), Le32(descriptor + 24));
+            if (!r.Ok())
+            {
+                r.message = DisplayName(headerPath) + (r.error == Error::CorruptImage ? " is damaged: " : ": ") + r.message + ".";
+                return r;
+            }
+            if (walk.files.empty())
+                return Fail(Error::NotADiscImage, DisplayName(headerPath) + " contains an empty XDVDFS game partition.", headerPath.string());
+
+            source = std::make_unique<ImageSource>(image, headerPath, std::move(walk.files), false);
+            return {};
+        }
+
+        // Resolve a selected GOD directory: users may choose the 00007000
+        // content folder or its title-ID parent rather than the header file.
+        std::optional<fs::path> FindSvodHeader(const fs::path& dir)
+        {
+            auto in = [](const fs::path& folder) -> std::optional<fs::path>
+            {
+                std::error_code ec;
+                for (fs::directory_iterator it(folder, fs::directory_options::skip_permission_denied, ec), end;
+                     !ec && it != end; it.increment(ec))
+                {
+                    std::error_code typeEc;
+                    if (!it->is_regular_file(typeEc) || typeEc)
+                        continue;
+                    const fs::path candidate = it->path();
+                    if (PathEqualsIgnoreCase(candidate.extension().string(), ".data"))
+                        continue;
+                    int fd = platform::OpenFile(candidate, O_RDONLY | O_CLOEXEC);
+                    if (fd < 0)
+                        continue;
+                    char magic[4]{};
+                    bool live = PreadAll(fd, magic, sizeof(magic), 0) == sizeof(magic) && memcmp(magic, "LIVE", 4) == 0;
+                    close(fd);
+                    if (live)
+                    {
+                        fs::path sibling = candidate;
+                        sibling += ".data";
+                        if (fs::is_directory(sibling))
+                            return candidate;
+                    }
+                }
+                return std::nullopt;
+            };
+            if (auto found = in(dir))
+                return found;
+            std::error_code ec;
+            for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+                 !ec && it != end; it.increment(ec))
+            {
+                std::error_code typeEc;
+                if (it->is_directory(typeEc) && !Hidden(it->path()))
+                    if (auto found = in(it->path()))
+                        return found;
+            }
+            return std::nullopt;
         }
 
         // Extracted folders.
@@ -654,11 +899,26 @@ namespace install
         if (ec)
             return Fail(Error::NotFound, std::format("Cannot open {}: {}.", path.string(), ec.message()), path.string());
         if (fs::is_directory(status))
+        {
+            if (auto header = FindSvodHeader(path))
+                return OpenSvod(*header, source);
             return OpenFolder(path, source);
+        }
         if (!fs::is_regular_file(status))
             return Fail(Error::NotADiscImage, path.string() + " is not a file or folder.", path.string());
         if (PathEqualsIgnoreCase(path.filename().string(), "default.xex"))
             return OpenFolder(path.parent_path().empty() ? fs::path(".") : path.parent_path(), source);
+        {
+            int fd = platform::OpenFile(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0)
+            {
+                char magic[4]{};
+                bool live = PreadAll(fd, magic, sizeof(magic), 0) == sizeof(magic) && memcmp(magic, "LIVE", 4) == 0;
+                close(fd);
+                if (live)
+                    return OpenSvod(path, source);
+            }
+        }
         return OpenImage(path, source, options);
     }
 
