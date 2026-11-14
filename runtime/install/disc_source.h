@@ -1,7 +1,9 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING).
 //
 // Where the installer copies the game from: an Xbox 360 disc image (.iso, an
-// XDVDFS game partition) or a folder holding an extracted disc. Both list
+// XDVDFS game partition), a multi-file LIVE/SVOD Games-on-Demand package in
+// XSF layout (the header file and its sibling .data folder), or a folder
+// holding an extracted disc. All list
 // their files with disc-relative paths and read them in bounded chunks, so a
 // 7.8 GB image is never mapped or loaded whole (a Steam Deck has 16 GB of RAM
 // shared with the GPU, and the image may sit on an SD card or USB stick).
