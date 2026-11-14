@@ -628,6 +628,12 @@ namespace install
                     close(fd);
                     return Fail(Error::CorruptImage, std::format("{} has an invalid SVOD fragment size ({} bytes).", fragmentPath.filename().string(), fragmentInfo.size), fragmentPath.string());
                 }
+                if (i + 1 < fragmentCount && fragmentInfo.size != ImageFile::kSvodFragmentSize)
+                {
+                    close(fd);
+                    return Fail(Error::CorruptImage, std::format("{} is {} bytes; every non-final SVOD fragment must be {} bytes.",
+                        fragmentPath.filename().string(), fragmentInfo.size, ImageFile::kSvodFragmentSize), fragmentPath.string());
+                }
                 image->fragments.push_back(fd);
                 image->fragmentSizes.push_back(fragmentInfo.size);
                 physicalTotal += fragmentInfo.size;
