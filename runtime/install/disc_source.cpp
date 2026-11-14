@@ -568,9 +568,9 @@ namespace install
             return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16;
         }
 
-        uint64_t Le64(const uint8_t* p)
+        uint64_t Be64(const uint8_t* p)
         {
-            return uint64_t(Le32(p)) | uint64_t(Le32(p + 4)) << 32;
+            return uint64_t(Be32(p)) << 32 | uint64_t(Be32(p + 4));
         }
 
         Result OpenSvod(const fs::path& headerPath, std::unique_ptr<DiscSource>& source)
@@ -589,13 +589,13 @@ namespace install
             std::string error;
             if (!ReadExact(image->fd, 0, headerInfo.size, 0, header, sizeof(header), error))
                 return Fail(Error::ReadError, "Cannot read the Xbox 360 package header: " + error, headerPath.string());
-            if (memcmp(header, "LIVE", 4) != 0 || header[0x3A9] != 1)
+            if (memcmp(header, "LIVE", 4) != 0 || Be32(header + 0x3A9) != 1)
                 return Fail(Error::UnsupportedFormat, DisplayName(headerPath) + " is not a multi-file Xbox 360 SVOD package.");
             if (header[0x391] & 0x01)
                 return Fail(Error::UnsupportedFormat, "This SVOD uses Enhanced GDF, not the XSF layout supported by this reader.");
 
-            const uint32_t fragmentCount = Le32(header + 0x39D);
-            const uint64_t declaredPhysicalSize = Le64(header + 0x3A1);
+            const uint32_t fragmentCount = Be32(header + 0x39D);
+            const uint64_t declaredPhysicalSize = Be64(header + 0x3A1);
             image->startDataBlock = Le24(header + 0x395);
             if (fragmentCount < 2 || fragmentCount > 4096)
                 return Fail(Error::CorruptImage, std::format("The SVOD header declares an invalid data-fragment count ({}).", fragmentCount), headerPath.string());
