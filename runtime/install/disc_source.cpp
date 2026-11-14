@@ -591,7 +591,8 @@ namespace install
                 return Fail(Error::ReadError, "Cannot read the Xbox 360 package header: " + error, headerPath.string());
             if (memcmp(header, "LIVE", 4) != 0 || Be32(header + 0x3A9) != 1)
                 return Fail(Error::UnsupportedFormat, DisplayName(headerPath) + " is not a multi-file Xbox 360 SVOD package.");
-            if (header[0x391] & 0x01)
+            // SvodDeviceDescriptor::features.enhanced_gdf_layout is bit 6 (0x40).
+            if (header[0x391] & 0x40)
                 return Fail(Error::UnsupportedFormat, "This SVOD uses Enhanced GDF, not the XSF layout supported by this reader.");
 
             const uint32_t fragmentCount = Be32(header + 0x39D);
